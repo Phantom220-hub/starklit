@@ -1,0 +1,544 @@
+name: Build StarkLite
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Generate project
+        run: |
+          cat > build.gradle <<'STARK_EOF'
+          plugins {
+              id 'fabric-loom' version '0.10-SNAPSHOT'
+          }
+
+          sourceCompatibility = JavaVersion.VERSION_1_8
+          targetCompatibility = JavaVersion.VERSION_1_8
+
+          archivesBaseName = project.archives_base_name
+          version = project.mod_version
+          group = project.maven_group
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": project.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.encoding = "UTF-8"
+              it.options.release = 8
+          }
+          STARK_EOF
+          cat > gradle.properties <<'STARK_EOF'
+          org.gradle.jvmargs=-Xmx1G
+          minecraft_version=1.16.5
+          yarn_mappings=1.16.5+build.10
+          loader_version=0.11.6
+          fabric_version=0.42.0+1.16
+          mod_version=0.1.0
+          maven_group=com.starklite
+          archives_base_name=starklite
+          STARK_EOF
+          cat > settings.gradle <<'STARK_EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  gradlePluginPortal()
+              }
+          }
+          STARK_EOF
+          mkdir -p src/main/java/com/starklite
+          cat > src/main/java/com/starklite/Config.java <<'STARK_EOF'
+          package com.starklite;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.List;
+
+          public class Config {
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+              private static Config instance = new Config();
+
+              public boolean hud = true;
+              public boolean fpsPing = true;
+              public boolean coords = true;
+              public boolean effects = true;
+              public boolean armor = true;
+              public boolean counters = true;
+              public boolean notifier = true;
+              public boolean marks = true;
+
+              // Слова из чата, на которые мод показывает уведомление. Можно править в файле config/starklite.json
+              public List<String> keywords = new ArrayList<>(Arrays.asList("ивент", "event", "airdrop", "аирдроп"));
+              public List<Mark> markList = new ArrayList<>();
+
+              public static class Mark {
+                  public String name;
+                  public int x;
+                  public int y;
+                  public int z;
+
+                  public Mark(String name, int x, int y, int z) {
+                      this.name = name;
+                      this.x = x;
+                      this.y = y;
+                      this.z = z;
+                  }
+              }
+
+              public static Config get() {
+                  return instance;
+              }
+
+              private static Path path() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("starklite.json");
+              }
+
+              public static void load() {
+                  try {
+                      Path p = path();
+                      if (Files.exists(p)) {
+                          String json = new String(Files.readAllBytes(p), StandardCharsets.UTF_8);
+                          Config c = GSON.fromJson(json, Config.class);
+                          if (c != null) {
+                              if (c.keywords == null) c.keywords = new ArrayList<>();
+                              if (c.markList == null) c.markList = new ArrayList<>();
+                              instance = c;
+                          }
+                      } else {
+                          instance.save();
+                      }
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+              }
+
+              public void save() {
+                  try {
+                      Files.write(path(), GSON.toJson(this).getBytes(StandardCharsets.UTF_8));
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+              }
+          }
+          STARK_EOF
+          mkdir -p src/main/java/com/starklite
+          cat > src/main/java/com/starklite/EventNotifier.java <<'STARK_EOF'
+          package com.starklite;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.sound.PositionedSoundInstance;
+          import net.minecraft.sound.SoundEvents;
+
+          import java.util.Locale;
+
+          public class EventNotifier {
+              private static String banner = null;
+              private static long until = 0;
+
+              public static void onChat(String message) {
+                  Config c = Config.get();
+                  if (!c.notifier || message == null) return;
+                  String low = message.toLowerCase(Locale.ROOT);
+                  for (String k : c.keywords) {
+                      if (k != null && !k.isEmpty() && low.contains(k.toLowerCase(Locale.ROOT))) {
+                          banner = message.length() > 70 ? message.substring(0, 70) + "..." : message;
+                          until = System.currentTimeMillis() + 6000;
+                          MinecraftClient.getInstance().getSoundManager()
+                                  .play(PositionedSoundInstance.master(SoundEvents.BLOCK_NOTE_BLOCK_PLING, 1.5F));
+                          return;
+                      }
+                  }
+              }
+
+              public static String banner() {
+                  if (banner != null && System.currentTimeMillis() > until) banner = null;
+                  return banner;
+              }
+          }
+          STARK_EOF
+          mkdir -p src/main/java/com/starklite
+          cat > src/main/java/com/starklite/SettingsScreen.java <<'STARK_EOF'
+          package com.starklite;
+
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.util.math.MatrixStack;
+          import net.minecraft.text.LiteralText;
+          import net.minecraft.text.Text;
+
+          import java.util.function.Consumer;
+          import java.util.function.Supplier;
+
+          public class SettingsScreen extends Screen {
+              private int row = 0;
+
+              public SettingsScreen() {
+                  super(new LiteralText("StarkLite"));
+              }
+
+              @Override
+              protected void init() {
+                  Config c = Config.get();
+                  row = 0;
+                  toggle(0, "HUD", () -> c.hud, v -> c.hud = v);
+                  toggle(1, "FPS и пинг", () -> c.fpsPing, v -> c.fpsPing = v);
+                  toggle(2, "Координаты", () -> c.coords, v -> c.coords = v);
+                  toggle(3, "Эффекты", () -> c.effects, v -> c.effects = v);
+                  toggle(4, "Броня", () -> c.armor, v -> c.armor = v);
+                  toggle(5, "Счётчики", () -> c.counters, v -> c.counters = v);
+                  toggle(6, "Уведомления", () -> c.notifier, v -> c.notifier = v);
+                  toggle(7, "Метки", () -> c.marks, v -> c.marks = v);
+                  this.addButton(new ButtonWidget(width / 2 - 100, height / 2 + 62, 200, 20,
+                          new LiteralText("Готово"), b -> this.onClose()));
+              }
+
+              private void toggle(int index, String name, Supplier<Boolean> get, Consumer<Boolean> set) {
+                  int col = index % 2;
+                  int r = index / 2;
+                  int x = col == 0 ? width / 2 - 155 : width / 2 + 5;
+                  int y = height / 2 - 70 + r * 33;
+                  this.addButton(new ButtonWidget(x, y, 150, 20, label(name, get.get()), b -> {
+                      set.accept(!get.get());
+                      Config.get().save();
+                      b.setMessage(label(name, get.get()));
+                  }));
+              }
+
+              private Text label(String name, boolean on) {
+                  return new LiteralText(name + ": " + (on ? "ВКЛ" : "ВЫКЛ"));
+              }
+
+              @Override
+              public void render(MatrixStack matrices, int mouseX, int mouseY, float delta) {
+                  this.renderBackground(matrices);
+                  drawCenteredText(matrices, this.textRenderer, this.title, this.width / 2, height / 2 - 95, 0xFFFFFF);
+                  super.render(matrices, mouseX, mouseY, delta);
+              }
+
+              @Override
+              public boolean isPauseScreen() {
+                  return false;
+              }
+          }
+          STARK_EOF
+          mkdir -p src/main/java/com/starklite
+          cat > src/main/java/com/starklite/StarkLite.java <<'STARK_EOF'
+          package com.starklite;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.font.TextRenderer;
+          import net.minecraft.client.network.ClientPlayNetworkHandler;
+          import net.minecraft.client.network.PlayerListEntry;
+          import net.minecraft.client.options.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.client.util.math.MatrixStack;
+          import net.minecraft.entity.effect.StatusEffectInstance;
+          import net.minecraft.item.Item;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.text.LiteralText;
+          import org.lwjgl.glfw.GLFW;
+
+          import java.util.Locale;
+
+          public class StarkLite implements ClientModInitializer {
+              // Текущий множитель зума. Читается в GameRendererMixin.
+              public static double zoom = 1.0;
+              private static double zoomTarget = 1.0;
+
+              private static KeyBinding menuKey, hudKey, zoomKey, markKey, unmarkKey, copyKey;
+
+              private static int frames = 0;
+              private static int fps = 0;
+              private static long lastFpsTime = System.currentTimeMillis();
+
+              @Override
+              public void onInitializeClient() {
+                  Config.load();
+                  menuKey = key("menu", GLFW.GLFW_KEY_RIGHT_SHIFT);
+                  hudKey = key("hud", GLFW.GLFW_KEY_H);
+                  zoomKey = key("zoom", GLFW.GLFW_KEY_C);
+                  markKey = key("mark", GLFW.GLFW_KEY_B);
+                  unmarkKey = key("unmark", GLFW.GLFW_KEY_N);
+                  copyKey = key("copy", GLFW.GLFW_KEY_K);
+
+                  ClientTickEvents.END_CLIENT_TICK.register(StarkLite::tick);
+                  HudRenderCallback.EVENT.register(StarkLite::render);
+              }
+
+              private static KeyBinding key(String id, int code) {
+                  return KeyBindingHelper.registerKeyBinding(
+                          new KeyBinding("key.starklite." + id, InputUtil.Type.KEYSYM, code, "category.starklite"));
+              }
+
+              private static void tick(MinecraftClient mc) {
+                  Config c = Config.get();
+
+                  while (menuKey.wasPressed()) {
+                      mc.openScreen(new SettingsScreen());
+                  }
+                  while (hudKey.wasPressed()) {
+                      c.hud = !c.hud;
+                      c.save();
+                  }
+
+                  // Плавный зум
+                  zoomTarget = (zoomKey.isPressed() && mc.currentScreen == null) ? 3.0 : 1.0;
+                  zoom += (zoomTarget - zoom) * 0.4;
+                  if (Math.abs(zoom - zoomTarget) < 0.01) zoom = zoomTarget;
+
+                  if (mc.player == null) {
+                      while (markKey.wasPressed()) { }
+                      while (unmarkKey.wasPressed()) { }
+                      while (copyKey.wasPressed()) { }
+                      return;
+                  }
+
+                  while (markKey.wasPressed()) {
+                      int n = c.markList.size() + 1;
+                      c.markList.add(new Config.Mark("M" + n,
+                              (int) Math.floor(mc.player.getX()),
+                              (int) Math.floor(mc.player.getY()),
+                              (int) Math.floor(mc.player.getZ())));
+                      c.save();
+                      mc.player.sendMessage(new LiteralText("Метка M" + n + " поставлена"), true);
+                  }
+                  while (unmarkKey.wasPressed()) {
+                      if (!c.markList.isEmpty()) {
+                          Config.Mark removed = c.markList.remove(c.markList.size() - 1);
+                          c.save();
+                          mc.player.sendMessage(new LiteralText("Метка " + removed.name + " удалена"), true);
+                      }
+                  }
+                  while (copyKey.wasPressed()) {
+                      String s = (int) Math.floor(mc.player.getX()) + " "
+                              + (int) Math.floor(mc.player.getY()) + " "
+                              + (int) Math.floor(mc.player.getZ());
+                      mc.keyboard.setClipboard(s);
+                      mc.player.sendMessage(new LiteralText("Координаты скопированы: " + s), true);
+                  }
+              }
+
+              private static int line(TextRenderer tr, MatrixStack m, String text, int x, int y, int color) {
+                  tr.drawWithShadow(m, text, (float) x, (float) y, color);
+                  return y + 10;
+              }
+
+              private static String mmss(int ticks) {
+                  int s = ticks / 20;
+                  return (s / 60) + ":" + ((s % 60) < 10 ? "0" : "") + (s % 60);
+              }
+
+              private static void render(MatrixStack m, float tickDelta) {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  Config c = Config.get();
+
+                  frames++;
+                  long now = System.currentTimeMillis();
+                  if (now - lastFpsTime >= 1000) {
+                      fps = frames;
+                      frames = 0;
+                      lastFpsTime = now;
+                  }
+
+                  if (mc.player == null || !c.hud || mc.options.hudHidden) return;
+
+                  TextRenderer tr = mc.textRenderer;
+                  int x = 4;
+                  int y = 4;
+
+                  // Уведомление о событии по центру сверху
+                  String banner = EventNotifier.banner();
+                  if (banner != null) {
+                      int sw = mc.getWindow().getScaledWidth();
+                      tr.drawWithShadow(m, banner, (sw - tr.getWidth(banner)) / 2f, 28f, 0xFFD700);
+                  }
+
+                  if (c.fpsPing) {
+                      String s = fps + " FPS";
+                      ClientPlayNetworkHandler h = mc.getNetworkHandler();
+                      PlayerListEntry e = h == null ? null : h.getPlayerListEntry(mc.player.getUuid());
+                      if (e != null) s += "  |  " + e.getLatency() + " мс";
+                      y = line(tr, m, s, x, y, 0xFFFFFF);
+                  }
+
+                  if (c.coords) {
+                      String s = String.format(Locale.ROOT, "XYZ: %.0f %.0f %.0f  %s",
+                              mc.player.getX(), mc.player.getY(), mc.player.getZ(),
+                              mc.player.getHorizontalFacing().name());
+                      y = line(tr, m, s, x, y, 0xAAAAAA);
+                  }
+
+                  if (c.armor) {
+                      StringBuilder sb = new StringBuilder("Броня:");
+                      boolean any = false;
+                      int min = 100;
+                      for (ItemStack st : mc.player.getArmorItems()) {
+                          if (st.isEmpty() || st.getMaxDamage() <= 0) continue;
+                          int pct = (st.getMaxDamage() - st.getDamage()) * 100 / st.getMaxDamage();
+                          sb.append(' ').append(pct).append('%');
+                          min = Math.min(min, pct);
+                          any = true;
+                      }
+                      if (any) y = line(tr, m, sb.toString(), x, y, min < 20 ? 0xFF5555 : 0xFFFFFF);
+                  }
+
+                  if (c.counters) {
+                      String s = "Тотем " + count(mc, Items.TOTEM_OF_UNDYING)
+                              + " | Яблоко " + count(mc, Items.ENCHANTED_GOLDEN_APPLE)
+                              + " | Жемчуг " + count(mc, Items.ENDER_PEARL);
+                      y = line(tr, m, s, x, y, 0xFFFFFF);
+                  }
+
+                  if (c.effects) {
+                      for (StatusEffectInstance ef : mc.player.getStatusEffects()) {
+                          String s = ef.getEffectType().getName().getString() + " " + (ef.getAmplifier() + 1)
+                                  + "  " + mmss(ef.getDuration());
+                          y = line(tr, m, s, x, y, ef.getEffectType().getColor());
+                      }
+                  }
+
+                  if (c.marks) {
+                      for (Config.Mark mk : c.markList) {
+                          double dx = mk.x + 0.5 - mc.player.getX();
+                          double dy = mk.y - mc.player.getY();
+                          double dz = mk.z + 0.5 - mc.player.getZ();
+                          int dist = (int) Math.sqrt(dx * dx + dy * dy + dz * dz);
+                          y = line(tr, m, mk.name + ": " + dist + " м  (" + mk.x + " " + mk.y + " " + mk.z + ")",
+                                  x, y, 0x55FFFF);
+                      }
+                  }
+              }
+
+              private static int count(MinecraftClient mc, Item item) {
+                  return mc.player.inventory.count(item);
+              }
+          }
+          STARK_EOF
+          mkdir -p src/main/java/com/starklite/mixin
+          cat > src/main/java/com/starklite/mixin/ChatHudMixin.java <<'STARK_EOF'
+          package com.starklite.mixin;
+
+          import com.starklite.EventNotifier;
+          import net.minecraft.client.gui.hud.ChatHud;
+          import net.minecraft.text.Text;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          @Mixin(ChatHud.class)
+          public class ChatHudMixin {
+              @Inject(method = "addMessage(Lnet/minecraft/text/Text;)V", at = @At("HEAD"))
+              private void starklite$onMessage(Text message, CallbackInfo ci) {
+                  EventNotifier.onChat(message.getString());
+              }
+          }
+          STARK_EOF
+          mkdir -p src/main/java/com/starklite/mixin
+          cat > src/main/java/com/starklite/mixin/GameRendererMixin.java <<'STARK_EOF'
+          package com.starklite.mixin;
+
+          import com.starklite.StarkLite;
+          import net.minecraft.client.render.Camera;
+          import net.minecraft.client.render.GameRenderer;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          @Mixin(GameRenderer.class)
+          public class GameRendererMixin {
+              @Inject(method = "getFov(Lnet/minecraft/client/render/Camera;FZ)D", at = @At("RETURN"), cancellable = true)
+              private void starklite$zoom(Camera camera, float tickDelta, boolean changingFov, CallbackInfoReturnable<Double> cir) {
+                  if (StarkLite.zoom > 1.001) {
+                      cir.setReturnValue(cir.getReturnValue() / StarkLite.zoom);
+                  }
+              }
+          }
+          STARK_EOF
+          mkdir -p src/main/resources/assets/starklite/lang
+          cat > src/main/resources/assets/starklite/lang/en_us.json <<'STARK_EOF'
+          {
+            "category.starklite": "StarkLite",
+            "key.starklite.menu": "Меню настроек",
+            "key.starklite.hud": "Вкл/выкл HUD",
+            "key.starklite.zoom": "Зум (держать)",
+            "key.starklite.mark": "Поставить метку",
+            "key.starklite.unmark": "Удалить последнюю метку",
+            "key.starklite.copy": "Копировать координаты"
+          }
+          STARK_EOF
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'STARK_EOF'
+          {
+            "schemaVersion": 1,
+            "id": "starklite",
+            "version": "${version}",
+            "name": "StarkLite",
+            "description": "Лёгкий клиентский HUD-мод: инфо, эффекты, броня, метки, уведомления, зум.",
+            "authors": ["StarkLite"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.starklite.StarkLite"]
+            },
+            "mixins": ["starklite.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.11.0",
+              "fabric": "*",
+              "minecraft": "1.16.x",
+              "java": ">=8"
+            }
+          }
+          STARK_EOF
+          mkdir -p src/main/resources
+          cat > src/main/resources/starklite.mixins.json <<'STARK_EOF'
+          {
+            "required": true,
+            "package": "com.starklite.mixin",
+            "compatibilityLevel": "JAVA_8",
+            "client": [
+              "ChatHudMixin",
+              "GameRendererMixin"
+            ],
+            "injectors": {
+              "defaultRequire": 1
+            }
+          }
+          STARK_EOF
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '7.3.3'
+      - name: Build
+        run: gradle build --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starklite
+          path: build/libs/*.jar
